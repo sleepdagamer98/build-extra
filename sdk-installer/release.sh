@@ -3,12 +3,12 @@
 # Recreate git-sdk-$VERSION.exe
 
 test -z "$1" && {
-	echo "Usage: $0 <version> [<gitbranch>]"
+	echo "Usage: $0 <version>"
 	exit 1
 }
 
 die () {
-	echo "$*" >&1
+	echo "$*" >&2
 	exit 1
 }
 
@@ -25,49 +25,61 @@ x86_64)
 	;;
 esac
 
-GIT_BRANCH="${2:-master}"
-GIT_CLONE_URL=https://github.com/git-for-windows/git
+GIT_SDK_URL=https://github.com/git-for-windows/git-sdk-$BITNESS 
 
 FAKEROOTDIR="$(cd "$(dirname "$0")" && pwd)/root"
 TARGET="$HOME"/git-sdk-installer-"$1"-$BITNESS.7z.exe
 OPTS7="-m0=lzma -mx=9 -md=64M"
 TMPPACK=/tmp.7z
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)"
+BIN_DIR=/mingw$BITNESS/bin
 
-mkdir -p "$FAKEROOTDIR/usr/bin" "$FAKEROOTDIR/etc" ||
-die "Could not create fake root directory"
+echo "Enumerating required files..." >&2
+# First, enumerate the .dll files needed by the .exe files, then, enumerate all
+# the .dll files in bin/, then filter out the duplicates (which are the .dll
+# files in bin/ which are needed by the .exe files).
+exes_and_dlls=
+todo="git.exe ../libexec/git-core/git-remote-https.exe "
+# Add DLLs' transitive dependencies
+while test -n "$todo"
+do
+	file=${todo%% *}
+        todo=${todo#* }
+	exes_and_dlls="$exes_and_dlls$file "
+
+        for dll in $(ldd "$BIN_DIR/$file" |
+		sed -ne "s|.*> $BIN_DIR/\\([^ ]*\\).*|\\1|p" \
+			-e "s|.*> ${BIN_DIR%bin}\\(libexec/git-core/[^ ]*\\).*|../\\1|p")
+        do
+                case " $exes_and_dlls $todo " in
+                *" $dll "*) ;; # already found/queued
+                *" ${dll#../libexec/git-core/} "*) ;; # already found/queued
+                *" ../libexec/git-core/$dll "*) ;; # already found/queued
+                *) test ! -f "$BIN_DIR/$dll" || todo="$todo$dll ";;
+                esac
+        done
+done
+
+echo "Copying and compressing files..." >&2
+rm -rf "$FAKEROOTDIR" &&
+mkdir -p "$FAKEROOTDIR/mini$BIN_DIR" ||
+die "Could not create $FAKEROOTDIR$BIN_DIR directory"
 
 sed -e "s|@@ARCH@@|$ARCH|g" \
 	-e "s|@@BITNESS@@|$BITNESS|g" \
-	-e "s|@@GIT_BRANCH@@|$GIT_BRANCH|g" \
-	-e "s|@@GIT_CLONE_URL@@|$GIT_CLONE_URL|g" \
+	-e "s|@@GIT_SDK_URL@@|$GIT_SDK_URL|g" \
 <"$SCRIPT_PATH"/setup-git-sdk.bat >"$FAKEROOTDIR"/setup-git-sdk.bat ||
 die "Could not generate setup script"
 
-cp /usr/bin/dash.exe "$FAKEROOTDIR/usr/bin/sh.exe" &&
-sed -e 's/^#\(XferCommand.*curl\).*/\1 --anyauth -C - -L -f %u >%o/' \
-	</etc/pacman.conf >"$FAKEROOTDIR/etc/pacman.conf.proxy" ||
-die "Could not copy extra files into fake root"
-
-fileList="$(cd / && echo \
-	etc/pacman.* \
-	usr/bin/pacman.exe \
-	usr/bin/curl.exe \
-	usr/bin/gpg.exe \
-	$(ldd /usr/bin/gpg.exe /usr/bin/curl.exe |
-	  sed -n 's/.* \/\(usr\/bin\/.*\.dll\) .*/\1/p' |
-	  sort |
-	  uniq) \
-	usr/ssl/certs/ca-bundle.crt \
-	var/lib/pacman)
-	$FAKEROOTDIR/setup-git-sdk.bat $FAKEROOTDIR/etc $FAKEROOTDIR/usr"
+(cd $BIN_DIR && cp $exes_and_dlls "$FAKEROOTDIR/mini$BIN_DIR") ||
+die "Could not copy .exe and .dll files into fake root"
 
 type 7za ||
 pacman -Sy --noconfirm p7zip ||
 die "Could not install 7-Zip"
 
 echo "Creating archive" &&
-(cd / && 7za -x'!var/lib/pacman/*' a $OPTS7 "$TMPPACK" $fileList) &&
+(cd "$FAKEROOTDIR" && 7za -x'!var/lib/pacman/*' a $OPTS7 "$TMPPACK" *) &&
 (cat "$SCRIPT_PATH/../7-Zip/7zSD.sfx" &&
  echo ';!@Install@!UTF-8!' &&
  echo 'Title="Git for Windows '$BITNESS'-bit SDK"' &&
@@ -80,8 +92,8 @@ echo "Creating archive" &&
  echo 'GUIMode="1"' &&
  echo 'InstallPath="C:\\git-sdk-'$BITNESS'"' &&
  echo 'OverwriteMode="2"' &&
- echo 'ExecuteFile="%%T\setup-git-sdk.bat"' &&
- echo 'Delete="%%T\setup-git-sdk.bat"' &&
+ echo 'ExecuteFile="setup-git-sdk.bat"' &&
+ echo 'Delete="setup-git-sdk.bat"' &&
  echo ';!@InstallEnd@!' &&
  cat "$TMPPACK") > "$TARGET" &&
 echo "Success! You will find the new installer at \"$TARGET\"." &&
